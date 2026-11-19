@@ -52,6 +52,8 @@ https://github.com/user-attachments/assets/c81b947a-24a1-4a44-b5d0-5d4c274beb93
 - **Xbox → Switch, live.** Every button, both sticks and the triggers are
   translated into Pro Controller reports at the Switch's polling rate.
   Stick inversion, A/B and X/Y swaps and a radial deadzone are configurable.
+- **Rumble both ways.** The host's rumble (the Switch's, or a PC's X-Input
+  rumble in Xbox 360 mode) is forwarded to the wireless controller's motors.
 - **Set-and-forget pairing.** Up to five bonded controllers; the dongle
   reconnects to whichever one comes back, and drops every input the instant a
   controller goes away so nothing stays "pressed".
@@ -176,7 +178,8 @@ working: it presents Microsoft's vendor ID with a product ID of its own (so
 Linux's xpad recognizes the controller interface, and Windows splits the
 device instead of letting its Xbox driver take all of it) and advertises the
 `XUSB10` compatible ID that Windows' Xbox 360 driver binds to. Rumble sent by
-the PC is accepted and ignored. The identity is set by `CONFIG_DONGLE_USB_XBOX_PID`
+the PC is forwarded to the wireless controller's motors (the LED part of the
+report is ignored). The identity is set by `CONFIG_DONGLE_USB_XBOX_PID`
 and mirrored in the console's permitted-dongle list. These are Microsoft's
 identifiers: for emulation of your own device.
 

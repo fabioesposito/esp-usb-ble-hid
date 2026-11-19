@@ -35,6 +35,10 @@ public:
   virtual GamepadInputs get_gamepad_inputs() const override;
   virtual void set_gamepad_inputs(const GamepadInputs &inputs) override;
 
+  // Rumble: the BLE rumble output report (id 3) for the two main motors,
+  // levels 0..255; the trigger motors stay off.
+  std::optional<ReportData> make_rumble_report(uint8_t left, uint8_t right) override;
+
   // HID handlers
   virtual std::optional<ReportData> on_attach() override;
   virtual std::optional<ReportData> on_hid_report(uint8_t report_id, const uint8_t *data,
@@ -70,4 +74,4 @@ protected:
   using RumbleReport = espp::XboxRumbleOutputReport<>;
   RumbleReport rumble_report;
   static constexpr uint8_t rumble_report_id = RumbleReport::ID;
-}; // class SwitchPro
+}; // class Xbox

@@ -76,7 +76,26 @@ void Xbox::set_gamepad_inputs(const GamepadInputs &inputs) {
 // HID handlers
 std::optional<GamepadDevice::ReportData> Xbox::on_attach() { return {}; }
 
-std::optional<GamepadDevice::ReportData> Xbox::on_hid_report(uint8_t report_id, const uint8_t *data,
-                                                             size_t len) {
+std::optional<GamepadDevice::ReportData> Xbox::on_hid_report(uint8_t, const uint8_t *, size_t) {
   return {};
+}
+
+// Rumble over BLE: output report id 3, payload
+//   [enable nibble][left trigger][right trigger][strong][weak]
+//   [sustain 10ms][release 10ms][loop count]
+// (the layout Linux's xpadneo driver uses). Enable bits: 0x01 weak (right main
+// motor), 0x02 strong (left main motor), 0x04 / 0x08 the trigger motors. The
+// effect is a long pulse reprogrammed by every host update, like the Windows
+// driver does; a zero-level update stops it.
+std::optional<GamepadDevice::ReportData> Xbox::make_rumble_report(uint8_t left, uint8_t right) {
+  RumbleReport report;
+  report.set_enabled(0x03);                                         // strong + weak main motors
+  report.set_magnitude(2, static_cast<uint8_t>(left * 100 / 255));  // strong = left
+  report.set_magnitude(3, static_cast<uint8_t>(right * 100 / 255)); // weak = right
+  report.set_duration(0xFF); // 2.55 s sustain, reprogrammed by each update
+  report.set_start_delay(0);
+  report.set_loop_count(0xEB);
+  auto bytes = report.get_report();
+  bytes[0] &= 0x0F; // the enable byte's high nibble is reserved (and uninitialized)
+  return ReportData{RumbleReport::ID, std::move(bytes)};
 }

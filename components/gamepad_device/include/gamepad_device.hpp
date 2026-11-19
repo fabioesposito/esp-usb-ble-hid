@@ -32,21 +32,22 @@ public:
   // Report Data
   virtual uint8_t get_input_report_id() const { return 0; }
   virtual std::vector<uint8_t> get_report_descriptor() const { return {}; }
-  virtual void set_report_data(uint8_t report_id, const uint8_t *data, size_t len) {}
-  virtual std::vector<uint8_t> get_report_data(uint8_t report_id) const { return {}; }
+  virtual void set_report_data(uint8_t, const uint8_t *, size_t) {}
+  virtual std::vector<uint8_t> get_report_data(uint8_t) const { return {}; }
 
   // Gamepad inputs
   virtual GamepadInputs get_gamepad_inputs() const { return {}; }
-  virtual void set_gamepad_inputs(const GamepadInputs &inputs) {}
+  virtual void set_gamepad_inputs(const GamepadInputs &) {}
 
   // Battery level
-  virtual void set_battery_level(uint8_t level) {}
+  virtual void set_battery_level(uint8_t) {}
   virtual uint8_t get_battery_level() const { return 0; }
+
+  // Rumble: build the device's output report for the two main motors, levels
+  // 0..255 (left = strong, right = weak). nullopt if the device has no rumble.
+  virtual std::optional<ReportData> make_rumble_report(uint8_t, uint8_t) { return {}; }
 
   // HID handlers
   virtual std::optional<ReportData> on_attach() { return {}; }
-  virtual std::optional<ReportData> on_hid_report(uint8_t report_id, const uint8_t *data,
-                                                  size_t len) {
-    return {};
-  }
+  virtual std::optional<ReportData> on_hid_report(uint8_t, const uint8_t *, size_t) { return {}; }
 }; // GamepadDevice

@@ -389,6 +389,14 @@ extern "C" void app_main(void) {
     battery_level_percent = 0;
     push_inputs(GamepadInputs{});
   });
+  // rumble: USB host -> BLE controller. The callback runs on the TinyUSB task:
+  // build the controller's rumble report and queue it; the BLE side writes it
+  // on its own task. Queued reports are dropped while no controller is
+  // subscribed, and a stale one never reaches the next controller.
+  usb_set_rumble_callback([](uint8_t left, uint8_t right) {
+    if (auto report = ble_gamepad->make_rumble_report(left, right))
+      ble_queue_output_report(report->first, std::move(report->second));
+  });
 
   // MARK: USB initialization -- as the controller the settings ask for
   // (descriptors are fixed at enumeration, so a changed setting applies at
