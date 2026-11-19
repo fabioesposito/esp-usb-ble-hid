@@ -7,6 +7,10 @@ on:
     types: [published]
   workflow_dispatch:
 
+# forks default to a read-only GITHUB_TOKEN; attaching release assets needs write
+permissions:
+  contents: write
+
 env:
   APP_NAME: 'ESP USB BLE HID'
   IDF_TARGET: 'esp32s3'
