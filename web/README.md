@@ -5,7 +5,7 @@ dongle. It talks to the dongle over **WebUSB** (the vendor / WebUSB interface th
 firmware exposes next to its gamepad HID interface) using espp `stream_frame`
 framing and the espp `dispatcher` modules the firmware registers.
 
-Hosted copy: <https://finger563.github.io/esp-usb-ble-hid/dongle_console.html>
+Hosted copy: <https://fabioesposito.github.io/esp-usb-ble-hid/dongle_console.html>
 
 ## Opening it
 
@@ -98,7 +98,7 @@ and falls back to the published ids `0x07` / `0x08`.
   (cancel rollback) or **Roll back to previous** (reboots into the old image).
 - **Update check** — after connecting (once the dongle's INFO is known), and
   whenever you click **Check for updates**, the console fetches
-  `https://api.github.com/repos/finger563/esp-usb-ble-hid/releases/latest`
+  `https://api.github.com/repos/fabioesposito/esp-usb-ble-hid/releases/latest`
   (unauthenticated) and compares the release tag with the running firmware's
   `git describe` string (leading `v` stripped, numeric major.minor.patch). The
   result is shown on the Firmware tab and in the **Latest release** row of the
