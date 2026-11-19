@@ -633,29 +633,25 @@ dependencies:
     - esp32s31
     version: 3.0.1
   h2zero/esp-nimble-cpp:
-    component_hash: 82c026539b4704ac691265542a71681af46f1d9d94439a8ad5edbc82d48c7692
+    component_hash: 5ad5cb2e83f5cd8bb17db7c479d91d8b10bed7f322cc7203c36d0ee32e275c0e
     dependencies:
     - name: espressif/esp_hosted
-      registry_url: https://components.espressif.com
-      require: private
       rules:
       - if: target in [esp32p4]
       version: '*'
     - name: espressif/esp_wifi_remote
-      registry_url: https://components.espressif.com
-      require: private
       rules:
       - if: target in [esp32p4]
       version: '>=0.5.3'
     - name: idf
-      require: private
       rules:
       - if: target in [esp32p4]
       version: '>=5.3.0'
     source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 2.6.0
+      git: https://github.com/fabioesposito/esp-nimble-cpp.git
+      path: .
+      type: git
+    version: bc5903a630f8147db75f3f545f7020714702f4e3
   idf:
     source:
       type: idf
@@ -716,6 +712,6 @@ direct_dependencies:
 - espp/usb_device
 - espressif/esp_tinyusb
 - idf
-manifest_hash: 8a13ebf3cecd6b19112efca64b98d61d97f91b5f7805060f6e78d0a8421e6b1e
+manifest_hash: e9615b34873ed9b68b419610de3c07098cd4f735b6abd71d8f679316d5f50563
 target: esp32s3
 version: 3.0.0

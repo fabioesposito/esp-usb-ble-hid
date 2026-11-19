@@ -28,3 +28,14 @@ dependencies:
   # part of the value (esp-cpp/espp#854), which made the stored BLE name fail
   # validation at boot and reset every setting to its default
   espp/nvs: '>=1.4.2'
+
+# 2.6.0 + the scan waiting-list race fix (nimble_host crash in
+# NimBLEScan::resetWaitingTimer when stop() clears the list from another
+# task); drop this once upstream merges and releases the fix
+overrides:
+  - h2zero/esp-nimble-cpp:
+      with:
+        h2zero/esp-nimble-cpp:
+          git: https://github.com/fabioesposito/esp-nimble-cpp.git
+          version: fix/scan-waiting-list-race
+      reason: "scan waiting-list head check-then-use race crashes nimble_host"
