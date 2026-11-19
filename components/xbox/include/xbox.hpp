@@ -39,6 +39,12 @@ public:
   // levels 0..255; the trigger motors stay off.
   std::optional<ReportData> make_rumble_report(uint8_t left, uint8_t right) override;
 
+  // Battery: the controller's own battery report (id 4) carries the level in
+  // quarters; the standard Battery Service characteristic (exact percent)
+  // takes precedence once the app has seen it.
+  uint8_t get_battery_report_id() const override { return BatteryReport::ID; }
+  uint8_t get_battery_level() const override;
+
   // HID handlers
   virtual std::optional<ReportData> on_attach() override;
   virtual std::optional<ReportData> on_hid_report(uint8_t report_id, const uint8_t *data,

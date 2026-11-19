@@ -42,6 +42,9 @@ public:
   // Battery level
   virtual void set_battery_level(uint8_t) {}
   virtual uint8_t get_battery_level() const { return 0; }
+  /// The HID report id carrying the device's own battery report (0 = none;
+  /// the standard Battery Service characteristic is handled separately).
+  virtual uint8_t get_battery_report_id() const { return 0; }
 
   // Rumble: build the device's output report for the two main motors, levels
   // 0..255 (left = strong, right = weak). nullopt if the device has no rumble.

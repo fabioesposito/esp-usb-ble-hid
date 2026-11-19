@@ -41,6 +41,10 @@ static std::shared_ptr<Gui> gui;
 static std::shared_ptr<GamepadDevice> ble_gamepad;
 static std::shared_ptr<espp::SwitchPro> usb_controller;
 static std::atomic<int> battery_level_percent{100};
+// whether the standard Battery Service characteristic (exact percent) has
+// delivered a level for the current controller: until then the controller's
+// own battery report (quarters only) is used
+static std::atomic<bool> have_bas_battery{false};
 static std::mutex serial_number_mutex;
 static std::string serial_number = "";
 
@@ -154,8 +158,10 @@ void notifyCB(NimBLERemoteCharacteristic *pRemoteCharacteristic, uint8_t *pData,
   // return.
   if (pRemoteCharacteristic->getUUID().equals(
           NimBLEUUID(espp::BatteryService::BATTERY_LEVEL_CHAR_UUID))) {
-    if (length >= 1)
+    if (length >= 1) {
       battery_level_percent = pData[0];
+      have_bas_battery = true;
+    }
     return;
   }
   // otherwise this is a HID report: which one is told by the characteristic's
@@ -164,6 +170,14 @@ void notifyCB(NimBLERemoteCharacteristic *pRemoteCharacteristic, uint8_t *pData,
   const uint8_t report_id =
       ble_report_id_for(pRemoteCharacteristic).value_or(ble_gamepad->get_input_report_id());
   ble_gamepad->set_report_data(report_id, pData, length);
+  if (report_id == ble_gamepad->get_battery_report_id()) {
+    // the controller's own battery report: quarters only, so it stands in
+    // until the exact Battery Service level arrives (some controllers never
+    // expose that characteristic)
+    if (!have_bas_battery.load())
+      battery_level_percent = ble_gamepad->get_battery_level();
+    return;
+  }
   if (report_id != ble_gamepad->get_input_report_id())
     return; // not the gamepad input report: nothing to forward
 
@@ -387,6 +401,7 @@ extern "C" void app_main(void) {
   // whatever was last reported, forever
   ble_set_disconnect_callback([]() {
     battery_level_percent = 0;
+    have_bas_battery = false;
     push_inputs(GamepadInputs{});
   });
   // rumble: USB host -> BLE controller. The callback runs on the TinyUSB task:

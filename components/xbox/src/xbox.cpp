@@ -73,6 +73,17 @@ void Xbox::set_gamepad_inputs(const GamepadInputs &inputs) {
   input_report.set_accelerator(inputs.r2.value);
 }
 
+// Battery: the status byte's bits 0-1 carry the capacity in quarters (0 low
+// .. 3 full -- the mapping Linux's xpadneo driver reads); the other bits are
+// cable / charging / error flags. 0 until a battery report has arrived.
+uint8_t Xbox::get_battery_level() const {
+  const auto data = battery_report.get_report();
+  if (data.empty())
+    return 0;
+  static constexpr uint8_t kQuarterPercent[] = {0, 33, 66, 100};
+  return kQuarterPercent[data[0] & 0x03];
+}
+
 // HID handlers
 std::optional<GamepadDevice::ReportData> Xbox::on_attach() { return {}; }
 

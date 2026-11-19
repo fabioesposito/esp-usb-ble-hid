@@ -196,6 +196,28 @@ int main() {
     CHECK(back.size() == 1 && back[0] == 0x2B);
   }
 
+  // ---- battery level decode: capacity quarters in bits 0-1 ----
+  {
+    CHECK(xbox.get_battery_report_id() == 4);
+    Xbox fresh;
+    CHECK(fresh.get_battery_level() == 0); // nothing received yet
+    const struct {
+      uint8_t status;
+      uint8_t percent;
+    } cases[] = {
+        {0x00, 0},   // empty / critical
+        {0x01, 33},  // low quarter
+        {0x02, 66},  // high quarter
+        {0x03, 100}, // full
+        {0x2B, 100}, // cable + charging flags do not affect the level
+        {0x83, 100}, // error flags do not affect the level
+    };
+    for (const auto &c : cases) {
+      fresh.set_report_data(4, &c.status, 1);
+      CHECK(fresh.get_battery_level() == c.percent);
+    }
+  }
+
   // ---- rumble report builder (id 3) ----
   {
     const auto full = xbox.make_rumble_report(255, 128);
