@@ -25,6 +25,25 @@ jobs:
         target: ${{ env.IDF_TARGET }}
         path: '.'
 
+    # The Xbox parser golden-vector test needs the espp headers the build just
+    # fetched (pinned by dependencies.lock), so it runs here rather than in the
+    # IDF-free host_tests workflow.
+    - name: Xbox parser host test
+      run: |
+        c++ -std=c++23 -Wall -Wextra -Werror -DFMT_HEADER_ONLY \
+          -I components/xbox/include -I components/gamepad_device/include \
+          -I components/gamepad_inputs/include \
+          -isystem managed_components/espp__hid-rp/include \
+          -isystem managed_components/espp__hid-rp/detail/hid-rp/hid-rp \
+          -isystem managed_components/espp__math/include \
+          -isystem managed_components/espp__base_component/include \
+          -isystem managed_components/espp__logger/include \
+          -isystem managed_components/espp__format/include \
+          -isystem managed_components/espp__format/detail/fmt/include \
+          components/xbox/test/xbox_host_test.cpp components/xbox/src/xbox.cpp \
+          managed_components/espp__logger/src/logger.cpp -lm -o xbox_test
+        ./xbox_test
+
     # Informational: the delta step rebuilds the BASE ref with this workflow's
     # IDF, so a base that predates an IDF bump (e.g. main on v5.5 vs v6.1 here)
     # cannot build. The "Build main" step above is the correctness gate.
