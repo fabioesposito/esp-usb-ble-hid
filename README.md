@@ -9,6 +9,7 @@
   <a href="https://github.com/finger563/esp-usb-ble-hid/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/finger563/esp-usb-ble-hid?label=release"></a>
   <a href="https://github.com/finger563/esp-usb-ble-hid/actions/workflows/build.yml"><img alt="Build" src="https://github.com/finger563/esp-usb-ble-hid/actions/workflows/build.yml/badge.svg"></a>
   <a href="https://github.com/finger563/esp-usb-ble-hid/actions/workflows/static_analysis.yml"><img alt="Static analysis" src="https://github.com/finger563/esp-usb-ble-hid/actions/workflows/static_analysis.yml/badge.svg"></a>
+  <a href="https://github.com/finger563/esp-usb-ble-hid/actions/workflows/host_tests.yml"><img alt="Host tests" src="https://github.com/finger563/esp-usb-ble-hid/actions/workflows/host_tests.yml/badge.svg"></a>
   <a href="https://finger563.github.io/esp-usb-ble-hid/dongle_console.html"><img alt="Web console" src="https://img.shields.io/badge/web%20console-open%20in%20browser-1fb6c9"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue"></a>
 </p>
@@ -275,6 +276,7 @@ BLE gamepad ──notify──▶ Xbox report parser ──▶ GamepadInputs ─
 | Services | `main/services.cpp` | Settings in NVS, and the OTA / core-dump / system / monitor / device-config services registered on the worker (one call each) |
 | Device config | `components/device_config` | The web console's protocol (module `0x10`) and module class, with host-side tests |
 | Controller parsing | `components/xbox`, `components/gamepad_inputs` | Xbox report layout → generic gamepad inputs |
+| Input mapping | `components/input_mapping` | Settings applied to each report (Y inversion, deadzone, A/B / X/Y swaps), X-Input scaling and the L+R registration window, with host-side tests |
 | Display | `components/gui` | The T-Dongle-S3 status screen (SquareLine / LVGL) |
 | Web console | `web/dongle_console.html` | The browser UI, published to GitHub Pages by `publish_webapp.yml` |
 

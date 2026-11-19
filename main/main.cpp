@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -19,6 +18,7 @@
 
 #include "ble.hpp"
 #include "bsp.hpp"
+#include "input_mapping.hpp"
 #include "services.hpp"
 #include "status_led.hpp"
 #include "usb.hpp"
@@ -55,30 +55,19 @@ static void set_serial_number(const std::string &sn) {
 
 /********* Input mapping ***************/
 
-// Radial deadzone: inside it the stick reads (0,0); outside it the remaining
-// travel is rescaled so full deflection still reaches 1.0.
-static void apply_deadzone(GamepadInputs::Joystick &j, float deadzone) {
-  if (deadzone <= 0.0f)
-    return;
-  const float mag = std::sqrt(j.x * j.x + j.y * j.y);
-  if (mag < deadzone) {
-    j.x = j.y = 0.0f;
-    return;
-  }
-  const float scale = std::min(1.0f, (mag - deadzone) / (1.0f - deadzone)) / mag;
-  j.x *= scale;
-  j.y *= scale;
-}
-
 // The last inputs pushed (before settings), so the report can be re-pushed by
-// the USB registration timer below; and the end of the registration window
-// (0 = none) during which L+R are held. One mutex serializes every report
-// push with the window transitions, so a notification arriving between the
-// timer's snapshot and its re-push can never be overwritten by the snapshot.
+// the USB registration timer below. One mutex serializes every report push
+// with the window transitions and the settings cache, so a notification
+// arriving between the timer's snapshot and its re-push can never be
+// overwritten by the snapshot.
 static std::mutex inputs_mutex;
 static GamepadInputs last_inputs{};
-static int64_t registration_until_us{0}; // guarded by inputs_mutex
-static constexpr int64_t kRegistrationWindowUs = 1000 * 1000;
+// The Switch's Change Grip/Order registration window (holds L+R for a moment
+// after every USB enumeration) and the mapping settings, both guarded by
+// inputs_mutex. The settings are cached here by apply_settings() so the
+// per-report path never copies the full settings (with their strings).
+static input_mapping::RegistrationWindow registration;
+static input_mapping::Settings mapping_settings;
 
 // Apply the user settings to the controller inputs and push them into the USB
 // controller's input report (streamed to the host by the USB sender task).
@@ -88,28 +77,11 @@ static void push_inputs_locked(GamepadInputs inputs) {
   // usb_registration_tick) so the dongle registers itself without a hand on
   // the wireless controller. (Switch Pro mode only: the window is never opened
   // in Xbox 360 mode.)
-  if (esp_timer_get_time() < registration_until_us) {
+  if (registration.holds_lr(esp_timer_get_time())) {
     inputs.buttons.l1 = 1;
     inputs.buttons.r1 = 1;
   }
-  const auto s = services_settings();
-  if (s.invert_left_y)
-    inputs.left_joystick.y = -inputs.left_joystick.y;
-  if (s.invert_right_y)
-    inputs.right_joystick.y = -inputs.right_joystick.y;
-  const float deadzone = s.deadzone_percent / 100.0f;
-  apply_deadzone(inputs.left_joystick, deadzone);
-  apply_deadzone(inputs.right_joystick, deadzone);
-  if (s.swap_ab) {
-    const bool a = inputs.buttons.a, b = inputs.buttons.b;
-    inputs.buttons.a = b;
-    inputs.buttons.b = a;
-  }
-  if (s.swap_xy) {
-    const bool x = inputs.buttons.x, y = inputs.buttons.y;
-    inputs.buttons.x = y;
-    inputs.buttons.y = x;
-  }
+  input_mapping::apply(inputs, mapping_settings);
   if (usb_personality() == device_config::UsbController::Xbox360) {
     // X-Input: the same physical layout as the wireless Xbox controller the
     // inputs come from, so buttons map one to one; the sticks are the settings-
@@ -133,14 +105,12 @@ static void push_inputs_locked(GamepadInputs inputs) {
     st.set(Button::Start, b.start);
     st.set(Button::Back, b.select);
     st.set(Button::Guide, b.home);
-    auto axis = [](float v) { return static_cast<int16_t>(std::clamp(v, -1.0f, 1.0f) * 32767.0f); };
-    auto trigger = [](float v) { return static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f); };
-    st.lx = axis(inputs.left_joystick.x);
-    st.ly = axis(inputs.left_joystick.y);
-    st.rx = axis(inputs.right_joystick.x);
-    st.ry = axis(inputs.right_joystick.y);
-    st.left_trigger = trigger(inputs.l2.value);
-    st.right_trigger = trigger(inputs.r2.value);
+    st.lx = input_mapping::axis(inputs.left_joystick.x);
+    st.ly = input_mapping::axis(inputs.left_joystick.y);
+    st.rx = input_mapping::axis(inputs.right_joystick.x);
+    st.ry = input_mapping::axis(inputs.right_joystick.y);
+    st.left_trigger = input_mapping::trigger(inputs.l2.value);
+    st.right_trigger = input_mapping::trigger(inputs.r2.value);
     usb_push_xinput(st);
     return;
   }
@@ -162,26 +132,17 @@ static void push_inputs(GamepadInputs inputs) {
 }
 
 // Polled every 50 ms: when the host has just finished the handshake and
-// started taking reports, hold L+R for kRegistrationWindowUs, then release.
+// started taking reports, hold L+R for a moment, then release.
 static void usb_registration_tick() {
   if (usb_personality() != device_config::UsbController::SwitchPro)
     return; // an X-Input host has no registration screen
-  static bool was_ready = false;
   const bool ready = usb_hid_ready();
   const int64_t now = esp_timer_get_time();
   // the window transition and the re-push happen under the same lock as every
   // other push, so the latest inputs are what gets (re)pushed
   std::lock_guard<std::mutex> lk(inputs_mutex);
-  if (ready && !was_ready) {
-    registration_until_us = now + kRegistrationWindowUs;
-    push_inputs_locked(last_inputs); // with L+R
-  } else if (!ready) {
-    registration_until_us = 0;
-  } else if (registration_until_us && now >= registration_until_us) {
-    registration_until_us = 0;
-    push_inputs_locked(last_inputs); // release L+R
-  }
-  was_ready = ready;
+  if (registration.tick(now, ready))
+    push_inputs_locked(last_inputs); // with L+R, or releasing them
 }
 
 /********* BLE callbacks ***************/
@@ -193,7 +154,8 @@ void notifyCB(NimBLERemoteCharacteristic *pRemoteCharacteristic, uint8_t *pData,
   // return.
   if (pRemoteCharacteristic->getUUID().equals(
           NimBLEUUID(espp::BatteryService::BATTERY_LEVEL_CHAR_UUID))) {
-    battery_level_percent = pData[0];
+    if (length >= 1)
+      battery_level_percent = pData[0];
     return;
   }
   // otherwise this is a HID report: which one is told by the characteristic's
@@ -323,8 +285,15 @@ static void apply_settings(const device_config::Settings &s) {
   set_led_brightness_percent(s.led_brightness);
   set_led_connected_brightness_percent(s.led_connected_brightness);
   set_led_activity_blink(s.led_activity_blink);
-  // the other settings are read per input report (push_inputs); the BLE name
-  // is read at boot (init_ble)
+  {
+    // cache the mapping settings for the per-report path, under the same lock
+    // as every push so a report never sees a half-applied change
+    std::lock_guard<std::mutex> lk(inputs_mutex);
+    mapping_settings = {s.invert_left_y, s.invert_right_y, s.swap_ab, s.swap_xy,
+                        s.deadzone_percent};
+  }
+  // the BLE name is read at boot (init_ble), the USB controller kind at boot
+  // (start_usb)
 }
 
 extern "C" void app_main(void) {

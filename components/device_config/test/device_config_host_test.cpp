@@ -1,8 +1,9 @@
 // Host-side unit test for the device-configuration payload encoding. The
 // protocol header is standard-library only, so this builds on a host:
-//
-//   c++ -std=c++20 -Wall -Wextra -Werror -I components/device_config/include \
-//       components/device_config/test/device_config_host_test.cpp -o dc_test && ./dc_test
+/*
+  c++ -std=c++20 -Wall -Wextra -Werror -I components/device_config/include \
+      components/device_config/test/device_config_host_test.cpp -o dc_test && ./dc_test
+*/
 
 #include <cstdio>
 
