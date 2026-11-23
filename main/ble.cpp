@@ -53,6 +53,9 @@ static void set_link_detail(std::string detail) {
 static NimBLEUUID hid_service_uuid(espp::HidService::SERVICE_UUID);
 static NimBLEUUID hid_input_uuid(espp::HidService::REPORT_UUID);
 static NimBLEUUID report_reference_uuid(espp::HidService::REPORT_DESCRIPTOR_UUID); // 0x2908
+static NimBLEUUID report_map_uuid(espp::HidService::REPORT_MAP_UUID);              // 0x2A4B
+static NimBLEUUID device_info_uuid(espp::DeviceInfoService::SERVICE_UUID);         // 0x180A
+static NimBLEUUID pnp_id_uuid(espp::DeviceInfoService::PNP_CHAR_UUID);             // 0x2A50
 
 static NimBLEUUID battery_service_uuid(espp::BatteryService::BATTERY_SERVICE_UUID);
 static NimBLEUUID battery_level_uuid(espp::BatteryService::BATTERY_LEVEL_CHAR_UUID);
@@ -77,6 +80,7 @@ static std::unordered_map<uint8_t, NimBLERemoteCharacteristic *> output_reports;
 // decide to connect (scan task) and used as the fallback if the GAP Device Name
 // cannot be read (scan-timer task), hence the mutex.
 static bond_name_callback_t bond_name_callback = nullptr;
+static controller_info_callback_t controller_info_callback = nullptr;
 static std::mutex advertised_name_mutex;
 static std::string advertised_name;
 
@@ -175,6 +179,34 @@ static std::string read_controller_name(NimBLEClient *client) {
   return clean;
 }
 
+// The report map (how to decode the reports) and the PnP ID (which controller
+// type this is: the key of its button-map profile). Both are optional; a
+// controller without a readable report map is decoded with the Xbox Wireless
+// layout, as it always was.
+static BleControllerInfo read_controller_info(NimBLEClient *client,
+                                              NimBLERemoteService *hid_service) {
+  BleControllerInfo info;
+  if (auto *chr = hid_service->getCharacteristic(report_map_uuid); chr && chr->canRead()) {
+    const auto value = chr->readValue();
+    info.report_map.assign(value.data(), value.data() + value.size());
+  }
+  if (auto *dis = client->getService(device_info_uuid)) {
+    if (auto *chr = dis->getCharacteristic(pnp_id_uuid); chr && chr->canRead()) {
+      // [vendor id source u8][vendor id u16][product id u16][version u16]
+      const auto value = chr->readValue();
+      if (value.size() >= 5) {
+        const uint8_t *d = value.data();
+        info.vid = static_cast<uint16_t>(d[1] | (d[2] << 8));
+        info.pid = static_cast<uint16_t>(d[3] | (d[4] << 8));
+      }
+    }
+  }
+  info.name = read_controller_name(client);
+  ble_logger.info("controller '{}' {:04x}:{:04x}, report map {} bytes", info.name, info.vid,
+                  info.pid, info.report_map.size());
+  return info;
+}
+
 // Forget everything about the current link. Called from the NimBLE host task
 // (disconnect callback) and from the scan timer (missed disconnect); the app is
 // told through the disconnect callback so it can neutralize its inputs.
@@ -236,7 +268,9 @@ static auto led_callback = [](auto &m, auto &cv) -> bool {
   using namespace std::chrono_literals;
   static espp::Rgb led_color(0.0f, 0.0f, 1.0f); // blue
   espp::Hsv hsv = led_color.hsv();
-  hsv.v = breathe();
+  // read the configured peak every tick so a settings change applies at once
+  hsv.v = breathe() *
+          (is_pairing.load() ? g_led_pairing_level.load() : g_led_reconnecting_level.load());
   set_led(hsv);
   std::unique_lock<std::mutex> lk(m);
   cv.wait_for(lk, 10ms);
@@ -477,6 +511,10 @@ static size_t subscribe_input_reports(NimBLEClient *client, std::string &why) {
     why = fmt::format("HID service not found ({} services discovered)", services.size());
     return 0;
   }
+  // Tell the app what this controller is (its report layout, its type) before
+  // its reports start arriving, so the first one is already decoded.
+  if (controller_info_callback)
+    controller_info_callback(read_controller_info(client, svc));
   size_t count = 0, report_chars = 0, failed = 0;
   for (auto *chr : svc->getCharacteristics(refresh)) {
     if (chr->getUUID() != hid_input_uuid)
@@ -555,10 +593,24 @@ private:
 };
 
 static void ensure_scanning(int64_t now) {
+  // NimBLEScan reports "not scanning" as soon as the controller finishes, while
+  // the NimBLE host task is still draining its scan-response waiting list.
+  // Starting the next scan from this task in that window clears the list
+  // underneath it and crashes in NimBLEScan::resetWaitingTimer(). Wait out the
+  // host task before restarting.
+  // shortcut: fixed 500 ms margin, revisit when esp-nimble-cpp makes the scan
+  // lifecycle safe across tasks.
+  static int64_t scan_inactive_since_us = 0;
+  static constexpr int64_t kScanRestartDelayUs = 500 * 1000;
   if (NimBLEDevice::getScan()->isScanning()) {
     link_state = BleLinkState::Scanning;
+    scan_inactive_since_us = 0;
     return;
   }
+  if (scan_inactive_since_us == 0)
+    scan_inactive_since_us = now;
+  if (now - scan_inactive_since_us < kScanRestartDelayUs)
+    return;
   static int64_t last_scan_start_us = 0;
   if (now - last_scan_start_us < kScanRetryUs)
     return;
@@ -738,9 +790,12 @@ static void start_scan(bool pairing) {
   // Set the callbacks to call when scan events occur, no duplicates
   pScan->setScanCallbacks(&scanCallbacks);
 
-  // Set scan interval (how often) and window (how long) in milliseconds
-  pScan->setInterval(100);
-  pScan->setWindow(100);
+  // Set scan interval (how often) and window (how long) in milliseconds. A 10%
+  // duty cycle keeps the radio (the board's largest idle load) off between
+  // windows; a controller advertising every few tens of ms is still found in
+  // well under a second.
+  pScan->setInterval(300);
+  pScan->setWindow(30);
 
   // Active scan will gather scan response data from advertisers
   // but will use more energy from both devices
@@ -793,6 +848,14 @@ void start_ble_pairing_thread(notify_callback_t callback) {
   notify_callback = callback;
   // accept new controllers for a while (the scan itself cycles every 5 s)
   pairing_until_us = esp_timer_get_time() + kPairingWindowUs;
+  // Already scanning: widen what the running scan accepts. Stopping and
+  // restarting it here races with the NimBLE host task's scan completion (see
+  // ensure_scanning) and used to crash the dongle when the button was pressed.
+  if (NimBLEDevice::getScan()->isScanning()) {
+    is_pairing = true;
+    breathing_period = pairing_breathing_period;
+    return;
+  }
   start_scan(true);
 }
 
@@ -806,6 +869,10 @@ uint8_t ble_bond_count() { return static_cast<uint8_t>(NimBLEDevice::getNumBonds
 
 void ble_set_bond_name_callback(bond_name_callback_t callback) {
   bond_name_callback = std::move(callback); // set once at startup, before scanning
+}
+
+void ble_set_controller_info_callback(controller_info_callback_t callback) {
+  controller_info_callback = std::move(callback); // set once at startup, before scanning
 }
 
 void ble_set_disconnect_callback(disconnect_callback_t callback) {

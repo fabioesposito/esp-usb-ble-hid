@@ -1,13 +1,12 @@
-// Host-side unit test for the input mapping (settings -> report, X-Input
-// scaling, and the L+R registration window). The header is standard-library
-// only (plus GamepadInputs), so this builds on a host:
+// Host-side unit test for the output-stage helpers (X-Input scaling and the
+// L+R registration window). The header is standard-library only (plus
+// GamepadInputs), so this builds on a host:
 /*
   c++ -std=c++20 -Wall -Wextra -Werror -I components/input_mapping/include \
       -I components/gamepad_inputs/include \
       components/input_mapping/test/input_mapping_host_test.cpp -lm -o im_test && ./im_test
 */
 
-#include <cmath>
 #include <cstdio>
 
 #include "input_mapping.hpp"
@@ -23,70 +22,7 @@ static int g_failures = 0;
     }                                                                                              \
   } while (0)
 
-static bool near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
-
 int main() {
-  // ---- radial deadzone ----
-  {
-    GamepadInputs::Joystick j{0.1f, -0.2f};
-    im::apply_deadzone(j, 0.0f); // disabled: untouched
-    CHECK(near(j.x, 0.1f) && near(j.y, -0.2f));
-    j = {0.1f, 0.1f}; // |(0.1, 0.1)| ~ 0.141 < 0.2: inside, zeroed
-    im::apply_deadzone(j, 0.2f);
-    CHECK(j.x == 0.0f && j.y == 0.0f);
-    j = {0.75f, 0.0f}; // outside: remaining travel rescaled, (0.75-0.5)/0.5 = 0.5
-    im::apply_deadzone(j, 0.5f);
-    CHECK(near(j.x, 0.5f) && near(j.y, 0.0f));
-    j = {1.0f, 0.0f}; // full deflection still reaches 1.0
-    im::apply_deadzone(j, 0.5f);
-    CHECK(near(j.x, 1.0f));
-    j = {0.6f, 0.8f}; // |(0.6, 0.8)| = 1: unchanged, direction preserved
-    im::apply_deadzone(j, 0.25f);
-    CHECK(near(j.x, 0.6f) && near(j.y, 0.8f));
-    j = {0.3f, 0.4f}; // mag 0.5, dz 0.25: new mag (0.5-0.25)/0.75 = 1/3
-    im::apply_deadzone(j, 0.25f);
-    CHECK(near(j.x, 0.2f) && near(j.y, 0.4f / 1.5f));
-    j = {0.0f, 0.0f}; // center stays center (no division by zero)
-    im::apply_deadzone(j, 0.5f);
-    CHECK(j.x == 0.0f && j.y == 0.0f);
-  }
-
-  // ---- settings applied to a report ----
-  {
-    GamepadInputs in{};
-    in.left_joystick = {0.5f, 0.25f};
-    in.right_joystick = {-0.5f, -0.25f};
-    in.buttons.a = 1;
-    in.buttons.x = 1;
-    im::apply(in, im::Settings{}); // defaults: both Y inverted, no swaps
-    CHECK(near(in.left_joystick.x, 0.5f) && near(in.left_joystick.y, -0.25f));
-    CHECK(near(in.right_joystick.x, -0.5f) && near(in.right_joystick.y, 0.25f));
-    CHECK(in.buttons.a == 1 && in.buttons.b == 0 && in.buttons.x == 1 && in.buttons.y == 0);
-
-    im::Settings s;
-    s.invert_left_y = false;
-    s.invert_right_y = false;
-    s.swap_ab = true;
-    s.swap_xy = true;
-    in = GamepadInputs{};
-    in.left_joystick = {0.0f, 0.25f};
-    in.buttons.a = 1;
-    in.buttons.x = 1;
-    im::apply(in, s);
-    CHECK(near(in.left_joystick.y, 0.25f)); // inversion off
-    CHECK(in.buttons.a == 0 && in.buttons.b == 1);
-    CHECK(in.buttons.x == 0 && in.buttons.y == 1);
-
-    s = im::Settings{};
-    s.deadzone_percent = 25;
-    in = GamepadInputs{};
-    in.left_joystick = {0.1f, 0.1f};  // inside the 25 % deadzone
-    in.right_joystick = {1.0f, 0.0f}; // full deflection survives
-    im::apply(in, s);
-    CHECK(in.left_joystick.x == 0.0f && in.left_joystick.y == 0.0f);
-    CHECK(near(in.right_joystick.x, 1.0f));
-  }
-
   // ---- X-Input scaling ----
   {
     CHECK(im::axis(0.0f) == 0);

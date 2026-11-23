@@ -29,11 +29,13 @@ int main() {
   s.led_brightness = 40;
   s.ble_name = "My Dongle";
   s.led_connected_brightness = 15;
+  s.led_reconnecting_brightness = 5;
+  s.led_pairing_brightness = 80;
   s.led_activity_blink = true;
   CHECK(s.validate().empty());
   const auto bytes = s.serialize();
   CHECK(bytes[0] == dc::kProtocolVersion);
-  CHECK(bytes[1] == 10); // ten TLVs
+  CHECK(bytes[1] == 12); // twelve TLVs
   const auto back = dc::Settings::parse(bytes, dc::Settings{});
   CHECK(back.has_value());
   CHECK(back && *back == s);
@@ -48,8 +50,16 @@ int main() {
   // ---- LED settings: defaults, range, bool strictness ----
   {
     CHECK(dc::Settings{}.led_connected_brightness == 25 && !dc::Settings{}.led_activity_blink);
+    CHECK(dc::Settings{}.led_reconnecting_brightness == 1 &&
+          dc::Settings{}.led_pairing_brightness == 100);
     dc::Settings bad;
     bad.led_connected_brightness = 101;
+    CHECK(!bad.validate().empty());
+    bad = dc::Settings{};
+    bad.led_reconnecting_brightness = 101;
+    CHECK(!bad.validate().empty());
+    bad = dc::Settings{};
+    bad.led_pairing_brightness = 101;
     CHECK(!bad.validate().empty());
     std::vector<uint8_t> blink2{dc::kProtocolVersion, 1, uint8_t(dc::Key::LedActivityBlink), 1, 2};
     CHECK(!dc::Settings::parse(blink2, dc::Settings{}).has_value());
@@ -57,6 +67,24 @@ int main() {
                                60};
     const auto l = dc::Settings::parse(level, dc::Settings{});
     CHECK(l && l->led_connected_brightness == 60 && !l->led_activity_blink);
+    // reconnecting / pairing levels: partial set, and an older firmware's
+    // 10-TLV payload (without the new keys) leaves the base values alone
+    std::vector<uint8_t> recon{dc::kProtocolVersion, 1, uint8_t(dc::Key::LedReconnectingBrightness),
+                               1, 7};
+    const auto rc = dc::Settings::parse(recon, s);
+    CHECK(rc && rc->led_reconnecting_brightness == 7 && rc->led_pairing_brightness == 80);
+    std::vector<uint8_t> pair{dc::kProtocolVersion, 1, uint8_t(dc::Key::LedPairingBrightness), 1,
+                              40};
+    const auto pr = dc::Settings::parse(pair, dc::Settings{});
+    CHECK(pr && pr->led_pairing_brightness == 40 && pr->led_reconnecting_brightness == 1);
+    auto old = s.serialize();
+    // drop the two new TLVs (they sit after led_conn, before led_blink)
+    const size_t at = 2 + 6 * 3 + (2 + s.ble_name.size()) + 3;
+    old.erase(old.begin() + at, old.begin() + at + 6);
+    old[1] = 10;
+    const auto ob = dc::Settings::parse(old, dc::Settings{});
+    CHECK(ob && ob->led_reconnecting_brightness == 1 && ob->led_pairing_brightness == 100 &&
+          ob->led_connected_brightness == 15);
   }
   // ---- unknown key is ignored (forward compatible) ----
   {
@@ -162,6 +190,13 @@ int main() {
           dback->usb_hid_reports == 999999 && dback->usb_hid_ready);
     CHECK(dback && dback->link_state == uint8_t(dc::Info::LinkState::Encrypting) &&
           dback->link_detail == d.link_detail);
+    CHECK(dback && !dback->needs_full_flash && !(db[1] & dc::Info::kFlagNeedsFullFlash));
+    d.needs_full_flash = true;
+    const auto fb = d.serialize();
+    CHECK(fb[1] & dc::Info::kFlagNeedsFullFlash);
+    CHECK(fb.size() == db.size()); // a flag, not a field
+    const auto fback = dc::Info::parse(fb);
+    CHECK(fback && fback->needs_full_flash && fback->usb_hid_ready);
     // the trailer is [3 x u32][link_state u8][link_detail str]: firmware from
     // before the link state stops after the counters, older firmware stops
     // before the counters
