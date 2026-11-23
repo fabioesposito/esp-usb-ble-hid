@@ -547,7 +547,11 @@ extern "C" void app_main(void) {
     report.set_duration(0xFF); // 2.55 s sustain, reprogrammed by each update
     report.set_start_delay(0);
     report.set_loop_count(0xEB);
-    ble_queue_output_report(espp::XboxRumbleOutputReport<>::ID, report.get_report());
+    auto bytes = report.get_report();
+    // espp 1.4.6's enable field is a bit-field struct whose unnamed padding
+    // nibble is never initialized; keep it zero (fixed in espp main)
+    bytes[0] &= 0x0F;
+    ble_queue_output_report(espp::XboxRumbleOutputReport<>::ID, std::move(bytes));
   });
 
   // MARK: USB initialization -- as the controller the settings ask for
