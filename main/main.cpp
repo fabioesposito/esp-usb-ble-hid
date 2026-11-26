@@ -27,6 +27,7 @@
 #include "ble.hpp"
 #include "bsp.hpp"
 #include "input_mapping.hpp"
+#include "rumble.hpp"
 #include "services.hpp"
 #include "status_led.hpp"
 #include "usb.hpp"
@@ -53,9 +54,9 @@ static std::atomic<int> battery_level_percent{100};
 // own battery report (quarters only) is used
 static std::atomic<bool> have_bas_battery{false};
 // whether the connected controller is the Xbox Wireless controller (Series
-// X|S, model 1914, BLE 045E:0B13): its battery report (id 4) and rumble output
-// report (id 3) layouts are the ones known here; other controllers' reports go
-// to the generic decoder
+// X|S, model 1914, BLE 045E:0B13), whose own battery report (id 4) layout is
+// known here; other controllers' reports go to the generic decoder (rumble is
+// driven from each controller's report map, see rumble.cpp)
 static std::atomic<bool> controller_is_xbox{false};
 static std::mutex serial_number_mutex;
 static std::string serial_number = "";
@@ -107,6 +108,24 @@ static espp::hid_rp::GamepadDecoder make_decoder(const BleControllerInfo &info,
   logger.info("'{}' ({:04x}:{:04x}): {} layout", info.name, info.vid, info.pid,
               espp::hid_rp::GamepadDecoder::layout_name(d.quirks().layout));
   return d;
+}
+
+// The controller's rumble encoder, from ITS OWN report map only: a controller
+// whose map could not be read (and is decoded as an Xbox controller) is not
+// assumed to rumble like one, so nothing is ever written to an output report
+// the controller did not declare as rumble.
+static std::optional<espp::hid_rp::RumbleEncoder> make_rumble_encoder(const BleControllerInfo &info,
+                                                                      espp::Logger &logger) {
+  if (info.report_map.empty())
+    return std::nullopt;
+  const auto map = espp::hid_rp::ReportMap::parse(info.report_map);
+  auto encoder = map ? espp::hid_rp::RumbleEncoder::from_report_map(*map) : std::nullopt;
+  if (encoder)
+    logger.info("'{}': rumble report {} ({} actuators, effects up to {} ms)", info.name,
+                encoder->report_id(), encoder->actuator_count(), encoder->max_duration_ms());
+  else
+    logger.info("'{}': its report map declares no rumble report", info.name);
+  return encoder;
 }
 
 // The mapped state as the output stage's GamepadInputs. Positions keep the
@@ -323,6 +342,8 @@ static device_config::Info device_info() {
   info.usb_controller = static_cast<uint8_t>(usb_personality());
   // a v4 image on a v3 partition table: the console offers the full update
   info.needs_full_flash = !services_gamepad_storage_available();
+  // whether the connected controller declares a rumble report we can write
+  info.rumble_supported = info.ble_connected && rumble_supported();
   // where the controller link is (and why it is there), for the console
   using LinkState = device_config::Info::LinkState;
   switch (ble_link_state()) {
@@ -349,6 +370,46 @@ static device_config::Info device_info() {
   return info;
 }
 
+// The Device tab's Test rumble: the test pattern through the controller's
+// saved rumble options.
+static bool device_test_rumble(std::string &error) {
+  switch (rumble_test()) {
+  case RumbleTestResult::Ok:
+    return true;
+  case RumbleTestResult::NoController:
+    error = "no controller is connected";
+    return false;
+  case RumbleTestResult::CannotRumble:
+    error = "this controller does not declare a rumble report";
+    return false;
+  case RumbleTestResult::Off:
+    error = "rumble is off for this controller (Button mapping tab)";
+    return false;
+  }
+  error = "the rumble test could not be played";
+  return false;
+}
+
+// The Button mapping tab's Test: the test pattern through the (unsaved)
+// options the console shows; the saved ones are untouched. Returns at once.
+static bool gamepad_test_rumble(const espp::RumbleOptions &options, std::string &error) {
+  switch (rumble_test(options)) {
+  case RumbleTestResult::Ok:
+    return true;
+  case RumbleTestResult::NoController:
+    error = "no controller connected";
+    return false;
+  case RumbleTestResult::CannotRumble:
+    error = "the connected controller cannot rumble";
+    return false;
+  case RumbleTestResult::Off:
+    error = "rumble is off in these settings";
+    return false;
+  }
+  error = "the rumble test could not be played";
+  return false;
+}
+
 static bool device_action(device_config::Action action, std::string &error) {
   switch (action) {
   case device_config::Action::StartPairing:
@@ -361,6 +422,8 @@ static bool device_action(device_config::Action action, std::string &error) {
     // no bonds left, so this enters pairing mode
     start_ble_reconnection_thread(notifyCB);
     return true;
+  case device_config::Action::TestRumble:
+    return device_test_rumble(error);
   case device_config::Action::Reboot:
     // let the OK reply reach the host first
     std::thread([]() {
@@ -456,15 +519,26 @@ extern "C" void app_main(void) {
 #else
   espp::DispatcherWorker *vendor_link = nullptr; // plain HID build: no console stream
 #endif
+  // The console's map / rumble changes arrive under the gamepad store's change
+  // mutex and take decode_mutex, then (rumble) the sender's mutex: the same
+  // order as a controller connecting (below), and the sender never takes
+  // decode_mutex.
   services_init(vendor_link, {.info = device_info,
                               .on_action = device_action,
                               .bonds = device_bonds,
                               .forget_bond = device_forget_bond,
                               .on_settings_changed = apply_settings,
-                              .on_gamepad_map_changed = [](const espp::GamepadMap &map) {
-                                std::lock_guard<std::mutex> lk(decode_mutex);
-                                active_map = map;
-                              }});
+                              .on_gamepad_map_changed =
+                                  [](const espp::GamepadMap &map) {
+                                    std::lock_guard<std::mutex> lk(decode_mutex);
+                                    active_map = map;
+                                  },
+                              .on_gamepad_rumble_changed =
+                                  [](const espp::RumbleOptions &options) {
+                                    std::lock_guard<std::mutex> lk(decode_mutex);
+                                    rumble_set_options(options);
+                                  },
+                              .on_gamepad_test_rumble = gamepad_test_rumble});
   const auto settings = services_settings();
   apply_settings(settings);
   if (const auto report = services_crash_report(); !report.empty())
@@ -488,8 +562,15 @@ extern "C" void app_main(void) {
   bsp.initialize_button(on_button_pressed);
 
   // MARK: Gamepad initialization
-  usb_controller = std::make_shared<espp::SwitchPro>(
-      espp::SwitchPro::Config{.log_level = espp::Logger::Verbosity::WARN});
+  usb_controller = std::make_shared<espp::SwitchPro>(espp::SwitchPro::Config{
+      // the Switch's HD rumble (every 0x01 / 0x10 report), played on the BLE
+      // controller; runs on the TinyUSB task, rumble_set_target() does not block
+      .on_rumble =
+          [](const espp::hid_rp::SwitchRumble &r) { rumble_set_target(espp::to_rumble_state(r)); },
+      .log_level = espp::Logger::Verbosity::WARN});
+
+  // MARK: rumble sender (host rumble -> the BLE controller's motors)
+  rumble_start();
 
   // MARK: BLE initialization -- before USB: as soon as the device is mounted
   // the console can ask for status / bonds / actions, which use NimBLE.
@@ -500,16 +581,27 @@ extern "C" void app_main(void) {
       [](const std::array<uint8_t, 6> &address, uint8_t, const std::string &name) {
         services_set_bond_name(address, name);
       });
-  // a controller connecting: decode its reports with its own report map, and
-  // map them with its profile (or the default map)
+  // when the controller goes away (powered off, out of range, ...), release
+  // every button and center the sticks: the Switch would otherwise keep seeing
+  // whatever was last reported, forever
+  // a controller connecting: decode its reports with its own report map, map
+  // them with its profile (or the default map), and play the host's rumble on
+  // it with that profile's rumble options
   ble_set_controller_info_callback([&logger](const BleControllerInfo &info) {
     auto d = make_decoder(info, logger);
-    const auto map = services_gamepad_connected(info.vid, info.pid, info.name);
+    auto enc = make_rumble_encoder(info, logger);
     // the Xbox Wireless controller (Series X|S, model 1914): its own battery
-    // report and rumble output report layouts are known (see notifyCB / the
-    // rumble callback)
+    // report layout is known (see notifyCB)
     controller_is_xbox = (info.vid == 0x045E && info.pid == 0x0B13);
+    // the lookups happen under decode_mutex, which the console's change
+    // callbacks take too: a change either lands before them or notifies after,
+    // so the controller never keeps a stale map or stale rumble options. The
+    // options are in place before the encoder, so the host's rumble never
+    // plays on this controller with the previous one's options.
     std::lock_guard<std::mutex> lk(decode_mutex);
+    const auto map = services_gamepad_connected(info.vid, info.pid, info.name);
+    rumble_set_options(services_gamepad_rumble());
+    rumble_set_encoder(std::move(enc));
     decoder = std::move(d);
     active_map = map;
   });
@@ -520,6 +612,7 @@ extern "C" void app_main(void) {
     battery_level_percent = 0;
     have_bas_battery = false;
     controller_is_xbox = false;
+    rumble_set_encoder(std::nullopt); // nothing to drive; the next controller starts off
     {
       std::lock_guard<std::mutex> lk(decode_mutex);
       if (decoder)
@@ -528,36 +621,9 @@ extern "C" void app_main(void) {
     services_gamepad_disconnected();
     push_inputs(GamepadInputs{});
   });
-  // rumble: USB host -> BLE controller. The callback runs on the TinyUSB task:
-  // build the controller's rumble report and queue it; the BLE side writes it
-  // on its own task. Queued reports are dropped while no controller is
-  // subscribed, and a stale one never reaches the next controller.
-  usb_set_rumble_callback([](uint8_t left, uint8_t right) {
-    // Only the Xbox Wireless controller's rumble layout is known: output
-    // report id 3, [enable nibble][left trigger][right trigger][strong][weak]
-    // [sustain 10ms][release 10ms][loop count] (the layout Linux's xpadneo
-    // driver uses). Enable bits: 0x01 weak (right main motor), 0x02 strong
-    // (left main motor), 0x04 / 0x08 the trigger motors. Other controllers:
-    // nothing to drive.
-    if (!controller_is_xbox.load())
-      return;
-    espp::XboxRumbleOutputReport<> report;
-    if (left || right) {
-      report.set_enabled(0x03);                                         // strong + weak main motors
-      report.set_magnitude(2, static_cast<uint8_t>(left * 100 / 255));  // strong = left
-      report.set_magnitude(3, static_cast<uint8_t>(right * 100 / 255)); // weak = right
-      // a short pulse (300 ms), re-sent by the BLE sender while the level is
-      // non-zero: a lost write -- or a lost stop -- dies with the pulse
-      // instead of running for minutes
-      report.set_duration(0x1E);
-    }
-    // zero levels: the default report is all zero = the effect off (a stop)
-    auto bytes = report.get_report();
-    // espp 1.4.6's enable field is a bit-field struct whose unnamed padding
-    // nibble is never initialized; keep it zero (fixed in espp main)
-    bytes[0] &= 0x0F;
-    ble_queue_output_report(espp::XboxRumbleOutputReport<>::ID, std::move(bytes));
-  });
+  // rumble: the X-Input host's rumble, and an all-off target when the host
+  // unmounts or suspends (usb.cpp); the sender plays it on the controller
+  usb_set_rumble_callback([](const espp::RumbleState &rumble) { rumble_set_target(rumble); });
 
   // MARK: USB initialization -- as the controller the settings ask for
   // (descriptors are fixed at enumeration, so a changed setting applies at

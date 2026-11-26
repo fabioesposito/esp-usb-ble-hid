@@ -4,6 +4,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <span>
+#include <string>
 #include <unordered_map>
 
 #include "esp_timer.h"
@@ -53,6 +55,69 @@ static void set_link_detail(std::string detail) {
   link_detail = std::move(detail);
 }
 
+// What kind of BLE address this is, for logs and the console's Link block.
+static const char *address_kind(const NimBLEAddress &address) {
+  switch (address.getType()) {
+  case BLE_ADDR_PUBLIC:
+    return "public";
+  case BLE_ADDR_PUBLIC_ID:
+    return "public identity, resolved from a private address";
+  case BLE_ADDR_RANDOM_ID:
+    return "random identity, resolved from a private address";
+  default:
+    break;
+  }
+  if (address.isRpa())
+    return "random, resolvable private";
+  if (address.isNrpa())
+    return "random, non-resolvable private";
+  if (address.isStatic())
+    return "random static";
+  return "random";
+}
+
+// Whether an address seen while scanning belongs to a paired (bonded)
+// controller. The bond store holds each controller's identity address, typed
+// public (0) or random (1). A controller that reconnects with a resolvable
+// private address is reported, once the radio's resolving list (loaded with
+// the bonded controllers' IRKs) resolves it, with that same identity address
+// typed public identity (2) or random identity (3). NimBLEDevice::isBonded()
+// compares the type exactly and would miss it, so the controller would never
+// be reconnected to (NimBLE itself treats the two as the same device:
+// ble_gap_addr_type_equivalent()).
+static bool is_bonded_peer(const NimBLEAddress &address) {
+  if (NimBLEDevice::isBonded(address))
+    return true;
+  const uint8_t type = address.getType();
+  if (type == BLE_ADDR_PUBLIC_ID || type == BLE_ADDR_RANDOM_ID) {
+    // copy the ble_addr_t (its bytes LSB-first, as the bond store keeps them)
+    // and change only the type: NimBLEAddress(const uint8_t[6], type) expects
+    // MSB-first bytes and would reverse them
+    ble_addr_t identity = *address.getBase();
+    identity.type = type & 0x01;
+    return NimBLEDevice::isBonded(NimBLEAddress(identity));
+  }
+  return false;
+}
+
+// While reconnecting, a gamepad that advertises but is not paired is noted in
+// the link detail, with its kind of address: a paired controller that comes
+// back under an address the dongle does not recognise looks exactly like this.
+// Updated when the address changes and otherwise every 10 s, as scan results
+// arrive many times a second.
+static void note_unpaired_gamepad(const NimBLEAddress &address) {
+  static std::string last_address;
+  static int64_t last_note_us = 0;
+  const int64_t now = esp_timer_get_time();
+  const std::string a = address.toString();
+  if (a == last_address && now - last_note_us < 10'000'000)
+    return;
+  last_address = a;
+  last_note_us = now;
+  set_link_detail(fmt::format("scanning; a gamepad that is not paired is advertising: {} ({})", a,
+                              address_kind(address)));
+}
+
 static NimBLEUUID hid_service_uuid(espp::HidService::SERVICE_UUID);
 static NimBLEUUID hid_input_uuid(espp::HidService::REPORT_UUID);
 static NimBLEUUID report_reference_uuid(espp::HidService::REPORT_DESCRIPTOR_UUID); // 0x2908
@@ -74,15 +139,17 @@ static disconnect_callback_t disconnect_callback = nullptr;
 static std::mutex report_map_mutex;
 static std::unordered_map<const NimBLERemoteCharacteristic *, uint8_t> report_ids;
 // The HID *output* report characteristics by report id (Report Reference type
-// 2, e.g. the Xbox controller's rumble report), for ble_queue_output_report().
-// Stored as connection + value handles, not characteristic pointers: a
-// reconnect refreshes the services and frees those objects, while a write may
-// still be in flight. Same lifetime / lock as report_ids.
-struct BleOutputReport {
-  uint16_t handle;      // the characteristic's value handle
-  bool no_response;     // it supports write-without-response
+// 2, e.g. the Xbox controller's rumble report), for ble_write_output_report():
+// each one's GATT value handle and whether it takes a write without response,
+// plus the connection they belong to. Handles rather than characteristic
+// objects: a service refresh (every subscribe attempt) replaces the objects,
+// while a handle is a plain number that a write to a gone link simply fails
+// with. Same lock as report_ids.
+struct OutputReport {
+  uint16_t handle{0};
+  bool no_response{false}; ///< the characteristic takes a write without response
 };
-static std::unordered_map<uint8_t, BleOutputReport> output_reports;
+static std::unordered_map<uint8_t, OutputReport> output_reports;
 static uint16_t output_conn_handle{BLE_HS_CONN_HANDLE_NONE};
 
 // The controller's name, reported to the app once it is connected + subscribed
@@ -99,98 +166,35 @@ static NimBLEUUID device_name_uuid(espp::GenericAccessService::NAME_CHAR_UUID);
 
 static espp::Logger ble_logger({.tag = "BLE", .level = espp::Logger::Verbosity::INFO});
 
-// --- HID output reports (rumble): latest-wins queue + sender task ------------
-// ble_queue_output_report() records the report (any task may call it, e.g. the
-// TinyUSB task); the sender task does the BLE write. Only the latest queued
-// report is sent: rumble is a stream of levels, an old one is worthless.
-// Unchanged levels are not re-queued: while an effect is active the sender
-// re-sends it itself (keep-alive), so a host that repeats the same level in
-// every packet (the Switch does) costs no airtime. The effect itself is a
-// short pulse (see the app's rumble callback), so a lost write -- or a lost
-// stop -- dies with the pulse instead of running for minutes.
-static std::mutex rumble_mutex;
-static std::condition_variable rumble_cv;
-static bool rumble_pending{false};
-static bool rumble_active{false};      // the last report was non-zero: keep it alive
-static uint8_t rumble_report_id{0};
-static std::vector<uint8_t> rumble_data; // the last report queued (dedupe + keep-alive)
-static std::unique_ptr<espp::Task> rumble_task;
-
-// keep-alive period: must stay well under the effect's pulse length
-static constexpr auto kRumbleKeepalive = std::chrono::milliseconds(100);
-
-void ble_queue_output_report(uint8_t report_id, std::vector<uint8_t> data) {
-  if (!subscribed.load())
-    return; // no controller link: nothing to drive
-  {
-    std::lock_guard<std::mutex> lk(rumble_mutex);
-    if (report_id == rumble_report_id && data == rumble_data)
-      return; // unchanged level: the keep-alive already covers it
-    rumble_pending = true;
-    rumble_report_id = report_id;
-    rumble_data = std::move(data);
-  }
-  rumble_cv.notify_one();
+// --- HID output reports (rumble) ---------------------------------------------
+bool ble_has_output_report(uint8_t report_id) {
+  std::lock_guard<std::mutex> lk(report_map_mutex);
+  return output_reports.count(report_id) != 0;
 }
 
-// Write by connection + value handle, never through a characteristic object
-// (a reconnect frees those; see output_reports). The flat write fails cleanly
-// when the link is gone.
-static void rumble_write(uint8_t id, const std::vector<uint8_t> &data) {
+bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data) {
+  if (!subscribed.load() || data.empty() || data.size() > 0xFFFF)
+    return false;
+  OutputReport out;
   uint16_t conn = BLE_HS_CONN_HANDLE_NONE;
-  uint16_t handle = 0;
-  bool no_response = true;
   {
     std::lock_guard<std::mutex> lk(report_map_mutex);
-    const auto it = output_reports.find(id);
+    const auto it = output_reports.find(report_id);
     if (it == output_reports.end())
-      return;
+      return false;
+    out = it->second;
     conn = output_conn_handle;
-    handle = it->second.handle;
-    no_response = it->second.no_response;
   }
-  if (conn == BLE_HS_CONN_HANDLE_NONE || !subscribed.load())
-    return;
-  // prefer write-without-response (no round trip); the controller's rumble
-  // characteristic supports it. A failed write is not worth retrying: the
-  // effect is a short pulse, and the keep-alive re-sends it while active.
-  const int rc = no_response
-                     ? ble_gattc_write_no_rsp_flat(conn, handle, data.data(), data.size())
-                     : ble_gattc_write_flat(conn, handle, data.data(), data.size(), nullptr,
-                                            nullptr);
+  // Non-blocking either way: a write without response is queued for the next
+  // connection event; a write with response completes later (no callback
+  // needed: a lost write is covered by the sender re-sending)
+  const auto len = static_cast<uint16_t>(data.size());
+  const int rc = out.no_response
+                     ? ble_gattc_write_no_rsp_flat(conn, out.handle, data.data(), len)
+                     : ble_gattc_write_flat(conn, out.handle, data.data(), len, nullptr, nullptr);
   if (rc != 0)
-    ble_logger.debug("could not write HID output report {} ({})", id, rc);
-}
-
-static bool rumble_task_fn(std::mutex &, std::condition_variable &) {
-  uint8_t id = 0;
-  std::vector<uint8_t> data;
-  {
-    std::unique_lock<std::mutex> lk(rumble_mutex);
-    if (!rumble_pending) {
-      if (!rumble_active) {
-        rumble_cv.wait(lk, [] { return rumble_pending; });
-      } else {
-        // keep-alive: re-send the active effect before its pulse expires; a
-        // newly queued report supersedes it
-        rumble_cv.wait_for(lk, kRumbleKeepalive, [] { return rumble_pending; });
-        if (!rumble_pending) {
-          id = rumble_report_id;
-          data = rumble_data;
-        }
-      }
-    }
-    if (rumble_pending) {
-      rumble_pending = false;
-      id = rumble_report_id;
-      data = rumble_data; // copy: it stays for dedupe + keep-alive
-      // an all-zero report is a stop: nothing to keep alive afterwards
-      rumble_active = std::any_of(data.begin(), data.end(), [](uint8_t b) { return b != 0; });
-    }
-  }
-  if (!data.empty())
-    rumble_write(id, data);
-  return false; // don't stop the task
+    ble_logger.debug("could not write HID output report {} (rc {})", report_id, rc);
+  return rc == 0;
 }
 
 // connection parameters requested once the link is up / encrypted
@@ -272,14 +276,6 @@ static void reset_link_state(const std::string &why) {
     report_ids.clear();
     output_reports.clear();
     output_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-  }
-  {
-    // a rumble queued for the old link must not reach the next controller
-    std::lock_guard<std::mutex> lk(rumble_mutex);
-    rumble_pending = false;
-    rumble_active = false;
-    rumble_report_id = 0;
-    rumble_data.clear();
   }
   set_link_detail(why);
   if (was_subscribed) {
@@ -462,10 +458,12 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       // if we're pairing, then simply connect to the first device that advertises
       // the HID service. The connection callback will try to bond to it.
       should_connect = true;
-    } else if (!is_pairing && NimBLEDevice::isBonded(advertisedDevice->getAddress())) {
+    } else if (!is_pairing && is_bonded_peer(advertisedDevice->getAddress())) {
       // if we're not pairing, then we're reconnecting, so we need to check if
-      // the device is bonded
+      // the device is bonded (by its identity, see is_bonded_peer())
       should_connect = true;
+    } else if (!is_pairing && is_pairable_device) {
+      note_unpaired_gamepad(advertisedDevice->getAddress());
     }
     if (should_connect) {
       // tell the supervisor a connection is in flight BEFORE stopping the scan,
@@ -473,7 +471,9 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       connect_pending = true;
       connect_started_us = esp_timer_get_time();
       link_state = BleLinkState::Connecting;
-      set_link_detail(fmt::format("connecting to {}", advertisedDevice->getAddress().toString()));
+      set_link_detail(fmt::format("connecting to {} ({})",
+                                  advertisedDevice->getAddress().toString(),
+                                  address_kind(advertisedDevice->getAddress())));
 
       /** stop scan before connecting, since we use async connections and don't
           want to possibly try to connect to multiple devices. */
@@ -503,7 +503,9 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       static constexpr bool delete_on_disconnect = true;
       static constexpr bool delete_on_connect_fail = true;
       pClient->setSelfDelete(delete_on_disconnect, delete_on_connect_fail);
-      if (!pClient->connect(true, true,
+      // connect to the address just seen, not whatever a reused client was
+      // created for: a controller with a private address changes it
+      if (!pClient->connect(advertisedDevice->getAddress(), true, true,
                             false)) { // delete attributes, async connect, no MTU exchange
         logger.error("Failed to connect");
         set_link_detail("could not start the connection attempt");
@@ -588,12 +590,15 @@ static size_t subscribe_input_reports(NimBLEClient *client, std::string &why) {
     }
     if (report_type == 2) {
       // an output report (e.g. the Xbox controller's rumble report): remember
-      // its handles for ble_queue_output_report(), nothing to subscribe to
-      std::lock_guard<std::mutex> lk(report_map_mutex);
-      output_reports[report_id] = {chr->getHandle(), chr->canWriteNoResponse()};
-      output_conn_handle = client->getConnHandle();
-      ble_logger.info("HID output report id {} (handle {:#06x}) available", report_id,
-                      chr->getHandle());
+      // its handle for ble_write_output_report(), nothing to subscribe to
+      if (chr->canWriteNoResponse() || chr->canWrite()) {
+        std::lock_guard<std::mutex> lk(report_map_mutex);
+        output_reports[report_id] = {chr->getHandle(), chr->canWriteNoResponse()};
+        output_conn_handle = client->getConnHandle();
+        ble_logger.info("HID output report id {} (handle {:#06x}{}) available", report_id,
+                        chr->getHandle(),
+                        chr->canWriteNoResponse() ? ", write without response" : "");
+      }
       continue;
     }
     if (report_type != 1 || !chr->canNotify()) // skip feature reports / silent chars
@@ -883,14 +888,6 @@ static void start_scan(bool pairing) {
                             .callback = timer_callback,
                             .stack_size_bytes = 8192,
                             .log_level = espp::Logger::Verbosity::INFO});
-  }
-  if (!rumble_task) {
-    // sends queued HID output reports (rumble) with a blocking BLE write, off
-    // the TinyUSB / NimBLE host tasks
-    rumble_task =
-        espp::Task::make_unique({.callback = rumble_task_fn,
-                                 .task_config = {.name = "ble_rumble", .stack_size_bytes = 4096}});
-    rumble_task->start();
   }
 }
 
